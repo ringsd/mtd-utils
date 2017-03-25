@@ -1320,6 +1320,141 @@ static int add_file(const char *path_name, struct stat *st, ino_t inum,
 	return add_inode(st, inum, flags);
 }
 
+struct perms_item{
+	char		name[256];
+    mode_t    	st_mode;    /* protection */
+    uid_t     	st_uid;     /* user ID of owner */
+    gid_t     	st_gid;     /* group ID of owner */
+};
+
+struct perms_file{
+	int max_count;
+	int count;
+	struct perms_item* item_list;
+};
+
+static int g_has_perms_file = 0;
+static struct perms_file* g_perms_file;
+
+static void perms_file_load(const char* path_name)
+{
+	FILE* fp = fopen(path_name, "r");
+	if(fp)
+	{
+		g_perms_file = malloc(sizeof(struct perms_file));
+		if(g_perms_file)
+		{
+			g_perms_file->max_count = 2048;
+			g_perms_file->count = 0;
+			g_perms_file->item_list = malloc(g_perms_file->max_count * sizeof(struct perms_item) );
+
+			if(g_perms_file->item_list)
+			{
+				for(;;)
+				{
+					struct perms_item* item = &g_perms_file->item_list[g_perms_file->count];
+					char buf[2048];
+
+					if(!fgets(buf, sizeof(buf), fp))
+					{
+						break;
+					}
+					sscanf(buf, "perms:%o,owner:%d.%d,path:%s", &item->st_mode, &item->st_uid, &item->st_gid, item->name );
+					//printf("perms:%o,owner:%d.%d,path:%s\n", item->st_mode, item->st_uid, item->st_gid, item->name );
+
+					g_perms_file->count ++;
+					if(g_perms_file->count >= g_perms_file->max_count)
+					{
+						g_perms_file->max_count += 512;
+						g_perms_file->item_list = realloc(g_perms_file->item_list, g_perms_file->max_count * sizeof(struct perms_item) );
+						if(!g_perms_file->item_list)
+						{
+							break;
+						}
+					}
+				}
+				g_has_perms_file = 1;
+			}
+		}
+		fclose( fp );
+	}
+}
+
+static void perms_file_free(void)
+{
+	if(g_perms_file)
+	{
+		if(g_perms_file->item_list)
+		{
+			free(g_perms_file->item_list);
+		}
+		free(g_perms_file);
+	}
+}
+
+
+static void st_mode_find_perms(const char* path_name, struct stat *st)
+{
+	char path_name_win[1024];
+	char* p;
+	int i;
+
+	if( !g_has_perms_file ) return;
+
+	strcpy( path_name_win, path_name );
+	p = path_name_win;
+	while(*p){
+		if( *p == '/' ) *p = '\\';
+		p++;
+	}
+
+	for(i=0; i<g_perms_file->count; i++)
+	{
+		if( strcmp(path_name_win, g_perms_file->item_list[i].name) == 0 )
+		{
+			st->st_mode = st->st_mode & ~(S_IRWXU | S_IRWXG | S_IRWXO);
+			st->st_mode |= (g_perms_file->item_list[i].st_mode & (S_IRWXU | S_IRWXG | S_IRWXO));
+			st->st_uid = g_perms_file->item_list[i].st_uid;
+			st->st_gid = g_perms_file->item_list[i].st_gid;
+			break;
+		}
+	}
+
+	st->st_uid = 1002;
+	st->st_gid = 1002;
+}
+
+static void st_mode_2_str( mode_t st_mode, char str[] )
+{
+    strcpy(str, "----------");
+    
+	if (S_ISREG(st_mode)) {
+        str[0] = 'd';
+	} else if (S_ISCHR(st_mode))
+        str[0] = 'c';
+	else if (S_ISBLK(st_mode))
+        str[0] = 'b';
+	else if (S_ISLNK(st_mode))
+        str[0] = 'l';
+	else if (S_ISSOCK(st_mode))
+        str[0] = 's';
+	else if (S_ISFIFO(st_mode))
+        str[0] = 'f';
+	else
+        str[0] = '*';
+    
+	if (st_mode & S_IRUSR) str[1] = 'r';
+	if (st_mode & S_IWUSR) str[2] = 'w';
+	if (st_mode & S_IXUSR) str[3] = 'x';
+	if (st_mode & S_IRGRP) str[4] = 'r';
+	if (st_mode & S_IWGRP) str[5] = 'w';
+	if (st_mode & S_IXGRP) str[6] = 'x';
+	if (st_mode & S_IROTH) str[7] = 'r';
+	if (st_mode & S_IWOTH) str[8] = 'w';
+	if (st_mode & S_IXOTH) str[9] = 'x';
+}
+
+
 /**
  * add_non_dir - write a non-directory to the output file.
  * @path_name: source path name
@@ -1333,8 +1468,10 @@ static int add_non_dir(const char *path_name, ino_t *inum, unsigned int nlink,
 		       unsigned char *type, struct stat *st)
 {
 	int fd, flags = 0;
+    char str[11];
 
-	dbg_msg(2, "%s", path_name);
+    st_mode_2_str( st->st_mode, str );
+	dbg_msg(2, "%s %s", path_name, str);
 
 	if (S_ISREG(st->st_mode)) {
 		fd = open(path_name, O_RDONLY);
@@ -1514,6 +1651,8 @@ static int add_directory(const char *dir_name, ino_t dir_inum, struct stat *st,
 			goto out_free;
 
 		inum = ++c->highest_inum;
+
+		st_mode_find_perms(name, &dent_st);
 
 		if (S_ISDIR(dent_st.st_mode)) {
 			err = add_directory(name, inum, &dent_st, 0);
@@ -2327,6 +2466,8 @@ int main(int argc, char *argv[])
 	if (err)
 		return err;
 
+	perms_file_load("perms.txt");
+
 	err = open_target();
 	if (err)
 		return err;
@@ -2343,6 +2484,8 @@ int main(int argc, char *argv[])
 
 	if (verbose)
 		printf("Success!\n");
+
+	perms_file_free();
 
 	return 0;
 }
